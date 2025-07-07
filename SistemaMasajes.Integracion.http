@@ -1,0 +1,6 @@
+@SistemaMasajes.Integracion_HostAddress = http://localhost:5017
+
+GET {{SistemaMasajes.Integracion_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
