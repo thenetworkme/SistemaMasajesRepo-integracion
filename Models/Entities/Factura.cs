@@ -30,5 +30,6 @@ namespace SistemaMasajes.Integracion.Models.Entities
         public virtual ICollection<FacturaDetalle> Detalles { get; set; } = new List<FacturaDetalle>();
 
         public virtual ICollection<CuentaPorCobrar>? CuentasPorCobrar { get; set; }
+     //   public ICollection<FacturaDetalle> FacturaDetalles { get; set; } = new List<FacturaDetalle>();
     }
 }

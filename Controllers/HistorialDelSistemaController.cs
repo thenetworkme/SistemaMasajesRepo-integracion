@@ -5,7 +5,9 @@ using SistemaMasajes.Integracion.Data;
 using Microsoft.EntityFrameworkCore;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.Net.Http;
 using System;
+using SistemaMasajes.Integracion.Services.BackgroundSync; // Add this using directive
 
 namespace SistemaMasajes.Integracion.Controllers
 {
@@ -15,59 +17,69 @@ namespace SistemaMasajes.Integracion.Controllers
     {
         private readonly ICoreService _coreService;
         private readonly SistemaMasajesContext _context;
+        private readonly ISyncQueue _syncQueue; // Inject ISyncQueue
 
-        public HistorialDelSistemaController(ICoreService coreService, SistemaMasajesContext context)
+        public HistorialDelSistemaController(ICoreService coreService, SistemaMasajesContext context, ISyncQueue syncQueue) // Add ISyncQueue to constructor
         {
             _coreService = coreService;
             _context = context;
+            _syncQueue = syncQueue; // Assign ISyncQueue
         }
 
-        // GET: api/HistorialDelSistema
         [HttpGet]
         public async Task<ActionResult<IEnumerable<HistorialDelSistema>>> GetHistorial()
         {
             try
             {
                 var historial = await _coreService.GetAsync<List<HistorialDelSistema>>("HistorialDelSistema");
+                Console.WriteLine("Historial del Sistema obtenido del servicio Core.");
                 return Ok(historial);
             }
             catch (HttpRequestException ex)
             {
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para Get Historial. Obteniendo de BD local: {ex.Message}");
+                var historialLocal = await _context.HistorialSistema.ToListAsync(); // Fallback to local DB
+                return Ok(historialLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener historial: {ex.Message}");
             }
         }
 
-        // GET: api/HistorialDelSistema/{id}
         [HttpGet("{id}")]
         public async Task<ActionResult<HistorialDelSistema>> GetHistorialPorId(int id)
         {
             try
             {
                 var item = await _coreService.GetAsync<HistorialDelSistema>($"HistorialDelSistema/{id}");
-
                 if (item == null)
-                    return NotFound($"No se encontró el historial con ID {id}");
-
+                {
+                    Console.WriteLine($"Core no devolvió historial con ID {id}. Verificando en BD local.");
+                    var itemLocalFallback = await _context.HistorialSistema.FindAsync(id); // Fallback to local DB
+                    if (itemLocalFallback == null)
+                    {
+                        return NotFound($"No se encontró el historial con ID {id} ni en Core ni en BD local.");
+                    }
+                    return Ok(itemLocalFallback);
+                }
+                Console.WriteLine($"Historial con ID {id} obtenido del servicio Core.");
                 return Ok(item);
             }
             catch (HttpRequestException ex)
             {
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró el historial con ID {id}");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para Get Historial/{id}. Obteniendo de BD local: {ex.Message}");
+                var itemLocal = await _context.HistorialSistema.FindAsync(id); // Fallback to local DB
+                if (itemLocal == null)
+                    return NotFound($"No se encontró el historial con ID {id} en la BD local.");
+                return Ok(itemLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener historial con ID {id}: {ex.Message}");
             }
         }
 
-        // POST: api/HistorialDelSistema
         [HttpPost]
         public async Task<IActionResult> PostHistorial([FromBody] HistorialDelSistema historial)
         {
@@ -78,29 +90,45 @@ namespace SistemaMasajes.Integracion.Controllers
 
             try
             {
-                // Guardar en BD local
+                // 1. Save to local DB first
                 _context.HistorialSistema.Add(historial);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Historial del Sistema con ID {historial.Id} guardado localmente.");
 
-                // Enviar al servicio Core
-                var resultado = await _coreService.PostAsync<HistorialDelSistema>("HistorialDelSistema", historial);
-
-                await transaction.CommitAsync();
-                return Ok(new { mensaje = "Evento registrado correctamente", data = resultado });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                // 2. Attempt to send to Core service
+                try
+                {
+                    var resultadoCore = await _coreService.PostAsync<HistorialDelSistema>("HistorialDelSistema", historial);
+                    Console.WriteLine("Historial del Sistema enviado y confirmado por el servicio Core.");
+                    await transaction.CommitAsync(); // Commit local transaction if Core successful
+                    return Ok(new { mensaje = "Evento de historial registrado correctamente", data = resultadoCore });
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al enviar historial al servicio Core. Guardado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<HistorialDelSistema>("HistorialDelSistema", historial, "POST"); // Enqueue for synchronization
+                    Console.WriteLine($"Historial del Sistema con ID {historial.Id} encolado para sincronización.");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Evento de historial procesado. Guardado localmente, sincronización con Core intentada." });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al enviar historial al servicio Core. Guardado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<HistorialDelSistema>("HistorialDelSistema", historial, "POST"); // Enqueue for synchronization (unexpected error)
+                    Console.WriteLine($"Historial del Sistema con ID {historial.Id} encolado para sincronización (error inesperado).");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Evento de historial procesado. Guardado localmente, sincronización con Core intentada (error inesperado)." });
+                }
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al crear historial: {ex.Message}");
             }
         }
 
-        // DELETE: api/HistorialDelSistema/{id}
+        // DELETE: HistorialDelSistema is typically append-only, but including for completeness based on original code.
+        // Adapt logic if HistorialDelSistemaId is auto-generated and not passed in the request for deletion from Core.
         [HttpDelete("{id}")]
         public async Task<IActionResult> DeleteHistorial(int id)
         {
@@ -108,40 +136,50 @@ namespace SistemaMasajes.Integracion.Controllers
 
             try
             {
-                // Verificar en BD local
+                // 1. Verify and delete from local DB
                 var historial = await _context.HistorialSistema.FindAsync(id);
                 if (historial == null)
                 {
                     await transaction.RollbackAsync();
-                    return NotFound($"No se encontró el historial con ID {id} en BD local");
+                    return NotFound($"No se encontró el historial con ID {id} en BD local para eliminar.");
                 }
 
-                // Eliminar local
                 _context.HistorialSistema.Remove(historial);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Historial del Sistema con ID {id} eliminado localmente.");
 
-                // Eliminar del Core
-                await _coreService.DeleteAsync($"HistorialDelSistema/{id}");
-
-                await transaction.CommitAsync();
-                return Ok(new { mensaje = "Historial eliminado correctamente" });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró el historial con ID {id} en el servicio Core");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                // 2. Attempt to delete from Core service
+                try
+                {
+                    await _coreService.DeleteAsync($"HistorialDelSistema/{id}");
+                    Console.WriteLine("Historial del Sistema eliminado y confirmado por el servicio Core.");
+                    await transaction.CommitAsync(); // Commit local transaction if Core successful
+                    return Ok(new { mensaje = "Historial del Sistema eliminado correctamente" });
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al eliminar historial del servicio Core. Eliminado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<object>($"HistorialDelSistema/{id}", null, "DELETE"); // Enqueue for synchronization (using object for null body)
+                    Console.WriteLine($"Historial del Sistema con ID {id} encolado para sincronización.");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Historial del Sistema procesado. Eliminado localmente, sincronización con Core intentada." });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al eliminar historial del servicio Core. Eliminado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<object>($"HistorialDelSistema/{id}", null, "DELETE"); // Enqueue for synchronization (unexpected error)
+                    Console.WriteLine($"Historial del Sistema con ID {id} encolado para sincronización (error inesperado).");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Historial del Sistema procesado. Eliminado localmente, sincronización con Core intentada (error inesperado)." });
+                }
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al eliminar historial: {ex.Message}");
             }
         }
 
-        // EXTRA: GET local
         [HttpGet("local")]
         public async Task<ActionResult<IEnumerable<HistorialDelSistema>>> GetHistorialLocal()
         {

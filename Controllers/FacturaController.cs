@@ -5,6 +5,10 @@ using SistemaMasajes.Integracion.Data;
 using Microsoft.EntityFrameworkCore;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.Net.Http; // Added for HttpRequestException
+using System; // Added for DateTime
+using System.Linq; // Added for .Where() and .Any()
+using SistemaMasajes.Integracion.Services.BackgroundSync; // Add this using directive
 
 namespace SistemaMasajes.Integracion.Controllers
 {
@@ -14,11 +18,13 @@ namespace SistemaMasajes.Integracion.Controllers
     {
         private readonly ICoreService _coreService;
         private readonly SistemaMasajesContext _context;
+        private readonly ISyncQueue _syncQueue; // Inject ISyncQueue
 
-        public FacturaController(ICoreService coreService, SistemaMasajesContext context)
+        public FacturaController(ICoreService coreService, SistemaMasajesContext context, ISyncQueue syncQueue) // Add ISyncQueue to constructor
         {
             _coreService = coreService;
             _context = context;
+            _syncQueue = syncQueue; // Assign ISyncQueue
         }
 
         // GET: api/Factura
@@ -28,15 +34,20 @@ namespace SistemaMasajes.Integracion.Controllers
             try
             {
                 var facturas = await _coreService.GetAsync<List<Factura>>("Factura");
+                Console.WriteLine("Facturas obtenidas del servicio Core.");
                 return Ok(facturas);
             }
             catch (HttpRequestException ex)
             {
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para Get Facturas. Obteniendo de BD local: {ex.Message}");
+                var facturasLocal = await _context.Facturas
+                                                .Include(f => f.Cliente) // Include related Cliente if it's a navigation property
+                                                .ToListAsync();
+                return Ok(facturasLocal); // Fallback to local DB
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener facturas: {ex.Message}");
             }
         }
 
@@ -49,20 +60,33 @@ namespace SistemaMasajes.Integracion.Controllers
                 var factura = await _coreService.GetAsync<Factura>($"Factura/{id}");
 
                 if (factura == null)
-                    return NotFound($"No se encontró la factura con ID {id}");
-
+                {
+                    Console.WriteLine($"Core no devolvió factura con ID {id}. Verificando en BD local.");
+                    var facturaLocalFallback = await _context.Facturas
+                                                            .Include(f => f.Cliente)
+                                                            .FirstOrDefaultAsync(f => f.FacturaId == id); // Fallback to local DB
+                    if (facturaLocalFallback == null)
+                    {
+                        return NotFound($"No se encontró la factura con ID {id} ni en Core ni en BD local.");
+                    }
+                    return Ok(facturaLocalFallback);
+                }
+                Console.WriteLine($"Factura con ID {id} obtenida del servicio Core.");
                 return Ok(factura);
             }
             catch (HttpRequestException ex)
             {
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró la factura con ID {id}");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para Get Factura/{id}. Obteniendo de BD local: {ex.Message}");
+                var facturaLocal = await _context.Facturas
+                                                .Include(f => f.Cliente)
+                                                .FirstOrDefaultAsync(f => f.FacturaId == id); // Fallback to local DB
+                if (facturaLocal == null)
+                    return NotFound($"No se encontró la factura con ID {id} en la BD local.");
+                return Ok(facturaLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener factura con ID {id}: {ex.Message}");
             }
         }
 
@@ -73,18 +97,25 @@ namespace SistemaMasajes.Integracion.Controllers
             try
             {
                 var detalles = await _coreService.GetAsync<List<FacturaDetalle>>($"Factura/{id}/detalles");
+                Console.WriteLine($"Detalles de factura para FacturaID {id} obtenidos del servicio Core.");
                 return Ok(detalles);
             }
             catch (HttpRequestException ex)
             {
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró la factura con ID {id}");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para Get Detalles de Factura/{id}. Obteniendo de BD local: {ex.Message}");
+                var detallesLocal = await _context.FacturaDetalles
+                                                .Include(fd => fd.Factura) // Assuming FacturaDetalle has a navigation property to Factura
+                                                .Where(fd => fd.FacturaId == id)
+                                                .ToListAsync(); // Fallback to local DB
+                if (detallesLocal == null || !detallesLocal.Any())
+                {
+                    return NotFound($"No se encontraron detalles para la factura con ID {id} ni en Core ni en BD local.");
+                }
+                return Ok(detallesLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener detalles de factura para ID {id}: {ex.Message}");
             }
         }
 
@@ -99,27 +130,40 @@ namespace SistemaMasajes.Integracion.Controllers
 
             try
             {
-                // 1. Guardar en BD local
+                // 1. Save to local DB first
                 _context.Facturas.Add(factura);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Factura con ID {factura.FacturaId} guardada localmente.");
 
-                // 2. Enviar al servicio Core
-                var resultado = await _coreService.PostAsync<Factura>("Factura", factura);
-
-                // 3. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Factura creada correctamente", data = resultado });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                // 2. Attempt to send to Core service
+                try
+                {
+                    var resultadoCore = await _coreService.PostAsync<Factura>("Factura", factura);
+                    Console.WriteLine("Factura enviada y confirmada por el servicio Core.");
+                    await transaction.CommitAsync(); // Commit local transaction if Core successful
+                    return Ok(new { mensaje = "Factura creada correctamente", data = resultadoCore });
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al enviar factura al servicio Core. Guardada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Factura>("Factura", factura, "POST"); // Enqueue for synchronization
+                    Console.WriteLine($"Factura con ID {factura.FacturaId} encolada para sincronización.");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Guardada localmente, sincronización con Core intentada." });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al enviar factura al servicio Core. Guardada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Factura>("Factura", factura, "POST"); // Enqueue for synchronization (unexpected error)
+                    Console.WriteLine($"Factura con ID {factura.FacturaId} encolada para sincronización (error inesperado).");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Guardada localmente, sincronización con Core intentada (error inesperado)." });
+                }
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al crear factura: {ex.Message}");
             }
         }
 
@@ -134,38 +178,47 @@ namespace SistemaMasajes.Integracion.Controllers
 
             try
             {
-                // 1. Verificar que existe en BD local
+                // 1. Verify and update in local DB
                 var facturaExistente = await _context.Facturas.FindAsync(id);
                 if (facturaExistente == null)
                 {
                     await transaction.RollbackAsync();
-                    return NotFound($"No se encontró la factura con ID {id} en BD local");
+                    return NotFound($"No se encontró la factura con ID {id} en BD local para actualizar.");
                 }
 
-                // 2. Actualizar en BD local
                 _context.Entry(facturaExistente).CurrentValues.SetValues(factura);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Factura con ID {id} actualizada localmente.");
 
-                // 3. Enviar al servicio Core
-                var resultado = await _coreService.PutAsync<Factura>($"Factura/{id}", factura);
-
-                // 4. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Factura actualizada correctamente", data = resultado });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró la factura con ID {id} en el servicio Core");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                // 2. Attempt to send to Core service
+                try
+                {
+                    var resultadoCore = await _coreService.PutAsync<Factura>($"Factura/{id}", factura);
+                    Console.WriteLine("Factura actualizada y confirmada por el servicio Core.");
+                    await transaction.CommitAsync(); // Commit local transaction if Core successful
+                    return Ok(new { mensaje = "Factura actualizada correctamente", data = resultadoCore });
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al actualizar factura en el servicio Core. Actualizada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Factura>($"Factura/{id}", factura, "PUT"); // Enqueue for synchronization
+                    Console.WriteLine($"Factura con ID {id} encolada para sincronización.");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Actualizada localmente, sincronización con Core intentada." });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al actualizar factura en el servicio Core. Actualizada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Factura>($"Factura/{id}", factura, "PUT"); // Enqueue for synchronization (unexpected error)
+                    Console.WriteLine($"Factura con ID {id} encolada para sincronización (error inesperado).");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Actualizada localmente, sincronización con Core intentada (error inesperado)." });
+                }
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al actualizar factura: {ex.Message}");
             }
         }
 
@@ -177,38 +230,47 @@ namespace SistemaMasajes.Integracion.Controllers
 
             try
             {
-                // 1. Verificar que existe en BD local
+                // 1. Verify and delete from local DB
                 var facturaExistente = await _context.Facturas.FindAsync(id);
                 if (facturaExistente == null)
                 {
                     await transaction.RollbackAsync();
-                    return NotFound($"No se encontró la factura con ID {id} en BD local");
+                    return NotFound($"No se encontró la factura con ID {id} en BD local para eliminar.");
                 }
 
-                // 2. Eliminar de BD local
                 _context.Facturas.Remove(facturaExistente);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Factura con ID {id} eliminada localmente.");
 
-                // 3. Eliminar del servicio Core
-                await _coreService.DeleteAsync($"Factura/{id}");
-
-                // 4. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Factura eliminada correctamente" });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró la factura con ID {id} en el servicio Core");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                // 2. Attempt to delete from Core service
+                try
+                {
+                    await _coreService.DeleteAsync($"Factura/{id}");
+                    Console.WriteLine("Factura eliminada y confirmada por el servicio Core.");
+                    await transaction.CommitAsync(); // Commit local transaction if Core successful
+                    return Ok(new { mensaje = "Factura eliminada correctamente" });
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al eliminar factura del servicio Core. Eliminada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<object>($"Factura/{id}", null, "DELETE"); // Enqueue for synchronization (using object for null body)
+                    Console.WriteLine($"Factura con ID {id} encolada para sincronización.");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Eliminada localmente, sincronización con Core intentada." });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al eliminar factura del servicio Core. Eliminada solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<object>($"Factura/{id}", null, "DELETE"); // Enqueue for synchronization (unexpected error)
+                    Console.WriteLine($"Factura con ID {id} encolada para sincronización (error inesperado).");
+                    await transaction.CommitAsync(); // Commit local transaction even if Core fails
+                    return Ok(new { mensaje = "Factura procesada. Eliminada localmente, sincronización con Core intentada (error inesperado)." });
+                }
             }
             catch (Exception ex)
             {
                 await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al eliminar factura: {ex.Message}");
             }
         }
 
@@ -220,7 +282,7 @@ namespace SistemaMasajes.Integracion.Controllers
             {
                 var facturas = await _context.Facturas
                     .Include(f => f.Cliente) // Incluir datos del cliente si es necesario
-                    .Include(f => f.FacturaId) // Incluir detalles de la factura
+                                             // Removed: .Include(f => f.FacturaDetalles)
                     .ToListAsync();
                 return Ok(facturas);
             }
@@ -238,7 +300,7 @@ namespace SistemaMasajes.Integracion.Controllers
             {
                 var facturas = await _context.Facturas
                     .Include(f => f.Cliente)
-                    .Include(f => f.FacturaId)
+                    // Removed: .Include(f => f.FacturaDetalles)
                     .Where(f => f.ClienteId == clienteId)
                     .ToListAsync();
                 return Ok(facturas);
@@ -257,7 +319,7 @@ namespace SistemaMasajes.Integracion.Controllers
             {
                 var facturas = await _context.Facturas
                     .Include(f => f.Cliente)
-                    .Include(f => f.FacturaId)
+                    // Removed: .Include(f => f.FacturaDetalles)
                     .Where(f => f.Fecha.Date == fecha.Date)
                     .ToListAsync();
                 return Ok(facturas);
@@ -275,11 +337,11 @@ namespace SistemaMasajes.Integracion.Controllers
             try
             {
                 var detalles = await _context.FacturaDetalles
-                    .Include(fd => fd.FacturaId) // Incluir datos del servicio si es necesario
+                    .Include(fd => fd.Factura) // Assuming FacturaDetalle has a navigation property to Factura
                     .Where(fd => fd.FacturaId == id)
                     .ToListAsync();
 
-                if (detalles == null || detalles.Count == 0)
+                if (detalles == null || !detalles.Any())
                     return NotFound($"No se encontraron detalles para la factura con ID {id} en BD local");
 
                 return Ok(detalles);
@@ -300,7 +362,7 @@ namespace SistemaMasajes.Integracion.Controllers
             {
                 var facturas = await _context.Facturas
                     .Include(f => f.Cliente)
-                    .Include(f => f.FacturaId)
+                    // Removed: .Include(f => f.FacturaDetalles)
                     .Where(f => f.Fecha.Date >= fechaInicio.Date && f.Fecha.Date <= fechaFin.Date)
                     .ToListAsync();
                 return Ok(facturas);

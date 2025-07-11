@@ -1,9 +1,12 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using SistemaMasajes.Integracion.Models.Entities;
-using SistemaMasajes.Integracion.Services.Interfaces;
-using SistemaMasajes.Integracion.Data;
 using Microsoft.EntityFrameworkCore;
+using SistemaMasajes.Integracion.Data;
+using SistemaMasajes.Integracion.Models.Entities;
+using SistemaMasajes.Integracion.Services.BackgroundSync;
+using SistemaMasajes.Integracion.Services.Interfaces;
+using System;
 using System.Collections.Generic;
+using System.Net.Http;
 using System.Threading.Tasks;
 
 namespace SistemaMasajes.Integracion.Controllers
@@ -14,189 +17,199 @@ namespace SistemaMasajes.Integracion.Controllers
     {
         private readonly ICoreService _coreService;
         private readonly SistemaMasajesContext _context;
+        private readonly ISyncQueue _syncQueue;
 
-        public ClientesController(ICoreService coreService, SistemaMasajesContext context)
+        public ClientesController(ICoreService coreService, SistemaMasajesContext context, ISyncQueue syncQueue)
         {
             _coreService = coreService;
             _context = context;
+            _syncQueue = syncQueue;
         }
 
-        // GET: api/clientes
         [HttpGet]
         public async Task<ActionResult<IEnumerable<Cliente>>> GetClientes()
         {
             try
             {
                 var clientes = await _coreService.GetAsync<List<Cliente>>("Clientes");
+                Console.WriteLine("Clientes obtenidos del servicio Core.");
                 return Ok(clientes);
             }
             catch (HttpRequestException ex)
             {
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para GetClientes. Obteniendo de BD local: {ex.Message}");
+                var clientesLocal = await _context.Clientes.ToListAsync();
+                return Ok(clientesLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener clientes: {ex.Message}");
             }
         }
 
-        // GET: api/clientes/{id}
         [HttpGet("{id}")]
         public async Task<ActionResult<Cliente>> GetCliente(int id)
         {
             try
             {
                 var cliente = await _coreService.GetAsync<Cliente>($"Clientes/{id}");
-
                 if (cliente == null)
-                    return NotFound($"No se encontró el cliente con ID {id}");
-
+                {
+                    Console.WriteLine($"Core no devolvió cliente con ID {id}. Verificando en BD local.");
+                    var clienteLocalFallback = await _context.Clientes.FindAsync(id);
+                    if (clienteLocalFallback == null)
+                    {
+                        return NotFound($"No se encontró el cliente con ID {id} ni en Core ni en BD local.");
+                    }
+                    return Ok(clienteLocalFallback);
+                }
+                Console.WriteLine($"Cliente con ID {id} obtenido del servicio Core.");
                 return Ok(cliente);
             }
             catch (HttpRequestException ex)
             {
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró el cliente con ID {id}");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                Console.WriteLine($"Error al conectar con el servicio Core para GetCliente/{id}. Obteniendo de BD local: {ex.Message}");
+                var clienteLocal = await _context.Clientes.FindAsync(id);
+                if (clienteLocal == null)
+                    return NotFound($"No se encontró el cliente con ID {id} en la BD local.");
+                return Ok(clienteLocal);
             }
             catch (Exception ex)
             {
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al obtener cliente con ID {id}: {ex.Message}");
             }
         }
 
-        // POST: api/clientes
         [HttpPost]
         public async Task<IActionResult> PostCliente([FromBody] Cliente cliente)
         {
             if (cliente == null)
                 return BadRequest("Datos de cliente inválidos");
 
-            using var transaction = await _context.Database.BeginTransactionAsync();
-
             try
             {
-                // 1. Guardar en BD local
                 _context.Clientes.Add(cliente);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Cliente con ID {cliente.Id} guardado localmente.");
 
-                // 2. Enviar al servicio Core
-                var resultado = await _coreService.PostAsync<Cliente>("Clientes", cliente);
+                try
+                {
+                    var resultadoCore = await _coreService.PostAsync<Cliente>("Clientes", cliente);
+                    Console.WriteLine("Cliente enviado y confirmado por el servicio Core.");
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al enviar cliente al servicio Core. Guardado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>("Clientes", cliente, "POST");
+                    Console.WriteLine($"Cliente con ID {cliente.Id} encolado para sincronización.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al enviar cliente al servicio Core. Guardado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>("Clientes", cliente, "POST");
+                    Console.WriteLine($"Cliente con ID {cliente.Id} encolado para sincronización (error inesperado).");
+                }
 
-                // 3. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Cliente creado correctamente", data = resultado });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                return Ok(new { mensaje = "Cliente procesado. Guardado localmente, sincronización con Core intentada.", data = cliente });
             }
             catch (Exception ex)
             {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al crear cliente: {ex.Message}");
             }
         }
 
-        // PUT: api/clientes/{id}
         [HttpPut("{id}")]
         public async Task<IActionResult> PutCliente(int id, [FromBody] Cliente cliente)
         {
             if (cliente == null || id != cliente.Id)
                 return BadRequest("ID de cliente inválido o no coincide");
 
-            using var transaction = await _context.Database.BeginTransactionAsync();
-
             try
             {
-                // 1. Verificar que existe en BD local
                 var clienteExistente = await _context.Clientes.FindAsync(id);
                 if (clienteExistente == null)
                 {
-                    await transaction.RollbackAsync();
-                    return NotFound($"No se encontró el cliente con ID {id} en BD local");
+                    return NotFound($"No se encontró el cliente con ID {id} en BD local para actualizar.");
                 }
 
-                // 2. Actualizar en BD local
                 _context.Entry(clienteExistente).CurrentValues.SetValues(cliente);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Cliente con ID {id} actualizado localmente.");
 
-                // 3. Enviar al servicio Core
-                var resultado = await _coreService.PutAsync<Cliente>($"Clientes/{id}", cliente);
+                try
+                {
+                    await _coreService.PutAsync<Cliente>($"Clientes/{id}", cliente);
+                    Console.WriteLine("Cliente actualizado y confirmado por el servicio Core.");
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al actualizar cliente en el servicio Core. Actualizado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>($"Clientes/{id}", cliente, "PUT");
+                    Console.WriteLine($"Cliente con ID {id} encolado para sincronización.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al actualizar cliente en el servicio Core. Actualizado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>($"Clientes/{id}", cliente, "PUT");
+                    Console.WriteLine($"Cliente con ID {id} encolado para sincronización (error inesperado).");
+                }
 
-                // 4. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Cliente actualizado correctamente", data = resultado });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró el cliente con ID {id} en el servicio Core");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                return Ok(new { mensaje = "Cliente procesado. Actualizado localmente, sincronización con Core intentada." });
             }
             catch (Exception ex)
             {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al actualizar cliente: {ex.Message}");
             }
         }
 
-        // DELETE: api/clientes/{id}
         [HttpDelete("{id}")]
         public async Task<IActionResult> DeleteCliente(int id)
         {
-            using var transaction = await _context.Database.BeginTransactionAsync();
-
             try
             {
-                // 1. Verificar que existe en BD local
                 var clienteExistente = await _context.Clientes.FindAsync(id);
                 if (clienteExistente == null)
                 {
-                    await transaction.RollbackAsync();
-                    return NotFound($"No se encontró el cliente con ID {id} en BD local");
+                    return NotFound($"No se encontró el cliente con ID {id} en BD local para eliminar.");
                 }
 
-                // 2. Eliminar de BD local
                 _context.Clientes.Remove(clienteExistente);
                 await _context.SaveChangesAsync();
+                Console.WriteLine($"Cliente con ID {id} eliminado localmente.");
 
-                // 3. Eliminar del servicio Core
-                await _coreService.DeleteAsync($"Clientes/{id}");
+                try
+                {
+                    await _coreService.DeleteAsync($"Clientes/{id}");
+                    Console.WriteLine("Cliente eliminado y confirmado por el servicio Core.");
+                }
+                catch (HttpRequestException ex)
+                {
+                    Console.WriteLine($"Advertencia: Error al eliminar cliente del servicio Core. Eliminado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>($"Clientes/{id}", null, "DELETE");
+                    Console.WriteLine($"Cliente con ID {id} encolado para sincronización.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Advertencia: Error inesperado al eliminar cliente del servicio Core. Eliminado solo localmente. {ex.Message}");
+                    _syncQueue.Enqueue<Cliente>($"Clientes/{id}", null, "DELETE");
+                    Console.WriteLine($"Cliente con ID {id} encolado para sincronización (error inesperado).");
+                }
 
-                // 4. Confirmar transacción
-                await transaction.CommitAsync();
-
-                return Ok(new { mensaje = "Cliente eliminado correctamente" });
-            }
-            catch (HttpRequestException ex)
-            {
-                await transaction.RollbackAsync();
-                if (ex.Message.Contains("404"))
-                    return NotFound($"No se encontró el cliente con ID {id} en el servicio Core");
-
-                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+                return Ok(new { mensaje = "Cliente procesado. Eliminado localmente, sincronización con Core intentada." });
             }
             catch (Exception ex)
             {
-                await transaction.RollbackAsync();
-                return StatusCode(500, $"Error interno: {ex.Message}");
+                return StatusCode(500, $"Error interno al eliminar cliente: {ex.Message}");
             }
         }
 
-        // Método adicional para obtener clientes desde BD local
         [HttpGet("local")]
         public async Task<ActionResult<IEnumerable<Cliente>>> GetClientesLocal()
         {
             try
             {
                 var clientes = await _context.Clientes.ToListAsync();
+                Console.WriteLine("Clientes obtenidos directamente de la BD local.");
                 return Ok(clientes);
             }
             catch (Exception ex)
