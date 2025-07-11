@@ -1,117 +1,160 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
-using SistemaMasajes.Integracion.Data;
 using SistemaMasajes.Integracion.Models.Entities;
-using System;
+using SistemaMasajes.Integracion.Services.Interfaces;
+using SistemaMasajes.Integracion.Data;
+using Microsoft.EntityFrameworkCore;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading.Tasks;
+using System;
 
 namespace SistemaMasajes.Integracion.Controllers
 {
-    [Route("api/[controller]")]
     [ApiController]
+    [Route("api/[controller]")]
     public class ProductoController : ControllerBase
     {
+        private readonly ICoreService _coreService;
         private readonly SistemaMasajesContext _context;
 
-        public ProductoController(SistemaMasajesContext context)
+        public ProductoController(ICoreService coreService, SistemaMasajesContext context)
         {
+            _coreService = coreService;
             _context = context;
         }
 
-        // GET: api/Producto
         [HttpGet]
         public async Task<ActionResult<IEnumerable<Producto>>> GetProductos()
         {
-            return await _context.Productos
-                .FromSqlRaw("EXEC sp_ObtenerProductos")
-                .ToListAsync();
+            try
+            {
+                var productos = await _coreService.GetAsync<List<Producto>>("Producto");
+                return Ok(productos);
+            }
+            catch (HttpRequestException ex)
+            {
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-        // GET: api/Producto/{id}
-        [HttpGet("{id:int}")]
-        public async Task<ActionResult<Producto>> GetProductoById(int id)
+        [HttpGet("{id}")]
+        public async Task<ActionResult<Producto>> GetProducto(int id)
         {
-            var productos = await _context.Productos
-                .FromSqlRaw("EXEC sp_ObtenerProductoPorId @ProductoId = {0}", id)
-                .ToListAsync();
+            try
+            {
+                var producto = await _coreService.GetAsync<Producto>($"Producto/{id}");
+                if (producto == null)
+                    return NotFound($"Producto con ID {id} no encontrado");
 
-            var producto = productos.FirstOrDefault();
-
-            if (producto == null)
-                return NotFound($"Producto con ID {id} no encontrado");
-
-            return producto;
+                return Ok(producto);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-        // GET: api/Producto/nombre/{nombreProducto}
-        [HttpGet("nombre/{nombreProducto}")]
-        public async Task<ActionResult<IEnumerable<Producto>>> GetProductosByNombre(string nombreProducto)
-        {
-            var productos = await _context.Productos
-                .FromSqlInterpolated($"EXEC sp_BuscarProductoPorNombre @NombreProducto = {nombreProducto}")
-                .ToListAsync();
-
-            if (!productos.Any())
-                return NotFound($"No se encontraron productos con el nombre '{nombreProducto}'");
-
-            return productos;
-        }
-
-        // GET: api/Producto/disponible
-        [HttpGet("disponible")]
-        public async Task<ActionResult<IEnumerable<Producto>>> GetProductosDisponibles()
-        {
-            var productos = await _context.Productos
-                .Where(p => p.Disponible)
-                .ToListAsync();
-
-            return productos;
-        }
-
-        // POST: api/Producto
         [HttpPost]
-        public async Task<IActionResult> PostProducto(Producto producto)
+        public async Task<IActionResult> PostProducto([FromBody] Producto producto)
         {
-            await _context.Database.ExecuteSqlInterpolatedAsync($@"
-                EXEC sp_InsertarProducto 
-                    @NombreProducto={producto.NombreProducto}, 
-                    @DescripcionProducto={producto.DescripcionProducto}, 
-                    @PrecioProducto={producto.PrecioProducto}, 
-                    @Stock={producto.Stock}, 
-                    @Disponible={producto.Disponible}");
+            if (producto == null)
+                return BadRequest("Datos del producto inválidos");
 
-            return Ok("Producto insertado correctamente");
+            using var transaction = await _context.Database.BeginTransactionAsync();
+
+            try
+            {
+                _context.Productos.Add(producto);
+                await _context.SaveChangesAsync();
+
+                var resultado = await _coreService.PostAsync<Producto>("Producto", producto);
+
+                await transaction.CommitAsync();
+                return Ok(new { mensaje = "Producto creado correctamente", data = resultado });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-        // PUT: api/Producto/{id}
         [HttpPut("{id}")]
-        public async Task<IActionResult> PutProducto(int id, Producto producto)
+        public async Task<IActionResult> PutProducto(int id, [FromBody] Producto producto)
         {
-            if (id != producto.ProductoId)
-                return BadRequest("El ID no coincide");
+            if (producto == null || id != producto.ProductoId)
+                return BadRequest("ID de producto inválido o no coincide");
 
-            await _context.Database.ExecuteSqlInterpolatedAsync($@"
-                EXEC sp_ActualizarProducto 
-                    @ProductoId={producto.ProductoId}, 
-                    @NombreProducto={producto.NombreProducto}, 
-                    @DescripcionProducto={producto.DescripcionProducto}, 
-                    @PrecioProducto={producto.PrecioProducto}, 
-                    @Stock={producto.Stock}, 
-                    @Disponible={producto.Disponible}");
+            using var transaction = await _context.Database.BeginTransactionAsync();
 
-            return Ok("Producto actualizado");
+            try
+            {
+                var existente = await _context.Productos.FindAsync(id);
+                if (existente == null)
+                {
+                    await transaction.RollbackAsync();
+                    return NotFound($"No se encontró el producto con ID {id} en BD local");
+                }
+
+                _context.Entry(existente).CurrentValues.SetValues(producto);
+                await _context.SaveChangesAsync();
+
+                var resultado = await _coreService.PutAsync<Producto>($"Producto/{id}", producto);
+
+                await transaction.CommitAsync();
+                return Ok(new { mensaje = "Producto actualizado correctamente", data = resultado });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-        // DELETE: api/Producto/{id}
         [HttpDelete("{id}")]
         public async Task<IActionResult> DeleteProducto(int id)
         {
-            await _context.Database.ExecuteSqlInterpolatedAsync(
-                $"EXEC sp_EliminarProducto @ProductoId={id}");
+            using var transaction = await _context.Database.BeginTransactionAsync();
 
-            return NoContent();
+            try
+            {
+                var producto = await _context.Productos.FindAsync(id);
+                if (producto == null)
+                {
+                    await transaction.RollbackAsync();
+                    return NotFound($"No se encontró el producto con ID {id} en BD local");
+                }
+
+                _context.Productos.Remove(producto);
+                await _context.SaveChangesAsync();
+
+                await _coreService.DeleteAsync($"Producto/{id}");
+
+                await transaction.CommitAsync();
+                return Ok(new { mensaje = "Producto eliminado correctamente" });
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
+        }
+
+        [HttpGet("local")]
+        public async Task<ActionResult<IEnumerable<Producto>>> GetProductosLocal()
+        {
+            try
+            {
+                var productos = await _context.Productos.ToListAsync();
+                return Ok(productos);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error al obtener productos locales: {ex.Message}");
+            }
         }
     }
 }

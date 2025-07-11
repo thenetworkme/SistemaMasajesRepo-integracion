@@ -22,5 +22,6 @@ namespace SistemaMasajes.Integracion.Models.Entities
         public decimal MontoPendiente { get; set; }
 
         public bool Pagado { get; set; } = false;
+        public int ClienteId { get; internal set; }
     }
 }

@@ -24,6 +24,7 @@ namespace SistemaMasajes.Integracion.Models.Entities
         [StringLength(150)]
         public string? CorreoCliente { get; set; }
 
+
         public DateTime FechaRegistro { get; set; } = DateTime.Now;
 
         // Navegación

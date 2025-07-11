@@ -1,111 +1,208 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.SqlClient;
-using Microsoft.EntityFrameworkCore;
-using SistemaMasajes.Integracion.Data;
 using SistemaMasajes.Integracion.Models.Entities;
-using System;
+using SistemaMasajes.Integracion.Services.Interfaces;
+using SistemaMasajes.Integracion.Data;
+using Microsoft.EntityFrameworkCore;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading.Tasks;
 
 namespace SistemaMasajes.Integracion.Controllers
 {
-    [Route("api/[controller]")]
     [ApiController]
+    [Route("api/[controller]")]
     public class ClientesController : ControllerBase
     {
+        private readonly ICoreService _coreService;
         private readonly SistemaMasajesContext _context;
 
-        public ClientesController(SistemaMasajesContext context)
+        public ClientesController(ICoreService coreService, SistemaMasajesContext context)
         {
+            _coreService = coreService;
             _context = context;
         }
 
-       
+        // GET: api/clientes
         [HttpGet]
-        public async Task<ActionResult<IEnumerable<Cliente>>> Get()
+        public async Task<ActionResult<IEnumerable<Cliente>>> GetClientes()
         {
-            var clientes = await _context.Clientes
-                .FromSqlRaw("EXEC sp_ObtenerClientes")
-                .ToListAsync();
-
-            return Ok(clientes);
+            try
+            {
+                var clientes = await _coreService.GetAsync<List<Cliente>>("Clientes");
+                return Ok(clientes);
+            }
+            catch (HttpRequestException ex)
+            {
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-     
+        // GET: api/clientes/{id}
         [HttpGet("{id}")]
         public async Task<ActionResult<Cliente>> GetCliente(int id)
         {
-            var clientes = await _context.Clientes
-                .FromSqlRaw("EXEC sp_ObtenerClientePorId @Id = {0}", id)
-                .ToListAsync();
-
-            var cliente = clientes.FirstOrDefault();
-
-            if (cliente == null)
-                return NotFound($"Cliente con ID {id} no encontrado");
-
-            return Ok(cliente);
-        }
-
-      
-        [HttpPost]
-        public async Task<ActionResult<Cliente>> PostCliente([FromBody] Cliente cliente)
-        {
-            if (!ModelState.IsValid)
-                return BadRequest(ModelState);
-
-            cliente.FechaRegistro = DateTime.Now;
-
-            var parameters = new[]
+            try
             {
-                new SqlParameter("@NombreCliente", cliente.NombreCliente),
-                new SqlParameter("@ApellidoCliente", cliente.ApellidoCliente),
-                new SqlParameter("@TelefonoCliente", cliente.TelefonoCliente),
-                new SqlParameter("@CorreoCliente", (object?)cliente.CorreoCliente ?? DBNull.Value),
-                new SqlParameter("@FechaRegistro", cliente.FechaRegistro)
-            };
+                var cliente = await _coreService.GetAsync<Cliente>($"Clientes/{id}");
 
-            await _context.Database.ExecuteSqlRawAsync(
-                "EXEC sp_InsertarCliente @NombreCliente, @ApellidoCliente, @TelefonoCliente, @CorreoCliente, @FechaRegistro",
-                parameters);
+                if (cliente == null)
+                    return NotFound($"No se encontró el cliente con ID {id}");
 
-           
-            return CreatedAtAction(nameof(GetCliente), new { id = cliente.Id }, cliente);
+                return Ok(cliente);
+            }
+            catch (HttpRequestException ex)
+            {
+                if (ex.Message.Contains("404"))
+                    return NotFound($"No se encontró el cliente con ID {id}");
+
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
+        // POST: api/clientes
+        [HttpPost]
+        public async Task<IActionResult> PostCliente([FromBody] Cliente cliente)
+        {
+            if (cliente == null)
+                return BadRequest("Datos de cliente inválidos");
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+
+            try
+            {
+                // 1. Guardar en BD local
+                _context.Clientes.Add(cliente);
+                await _context.SaveChangesAsync();
+
+                // 2. Enviar al servicio Core
+                var resultado = await _coreService.PostAsync<Cliente>("Clientes", cliente);
+
+                // 3. Confirmar transacción
+                await transaction.CommitAsync();
+
+                return Ok(new { mensaje = "Cliente creado correctamente", data = resultado });
+            }
+            catch (HttpRequestException ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
+        }
+
+        // PUT: api/clientes/{id}
         [HttpPut("{id}")]
         public async Task<IActionResult> PutCliente(int id, [FromBody] Cliente cliente)
         {
-            if (id != cliente.Id)
-                return BadRequest("El ID no coincide");
+            if (cliente == null || id != cliente.Id)
+                return BadRequest("ID de cliente inválido o no coincide");
 
-            if (!ModelState.IsValid)
-                return BadRequest(ModelState);
+            using var transaction = await _context.Database.BeginTransactionAsync();
 
-            var parameters = new[]
+            try
             {
-                new SqlParameter("@Id", id),
-                new SqlParameter("@NombreCliente", cliente.NombreCliente),
-                new SqlParameter("@ApellidoCliente", cliente.ApellidoCliente),
-                new SqlParameter("@TelefonoCliente", cliente.TelefonoCliente),
-                new SqlParameter("@CorreoCliente", (object?)cliente.CorreoCliente ?? DBNull.Value)
-            };
+                // 1. Verificar que existe en BD local
+                var clienteExistente = await _context.Clientes.FindAsync(id);
+                if (clienteExistente == null)
+                {
+                    await transaction.RollbackAsync();
+                    return NotFound($"No se encontró el cliente con ID {id} en BD local");
+                }
 
-            await _context.Database.ExecuteSqlRawAsync(
-                "EXEC sp_ActualizarCliente @Id, @NombreCliente, @ApellidoCliente, @TelefonoCliente, @CorreoCliente",
-                parameters);
+                // 2. Actualizar en BD local
+                _context.Entry(clienteExistente).CurrentValues.SetValues(cliente);
+                await _context.SaveChangesAsync();
 
-            return NoContent();
+                // 3. Enviar al servicio Core
+                var resultado = await _coreService.PutAsync<Cliente>($"Clientes/{id}", cliente);
+
+                // 4. Confirmar transacción
+                await transaction.CommitAsync();
+
+                return Ok(new { mensaje = "Cliente actualizado correctamente", data = resultado });
+            }
+            catch (HttpRequestException ex)
+            {
+                await transaction.RollbackAsync();
+                if (ex.Message.Contains("404"))
+                    return NotFound($"No se encontró el cliente con ID {id} en el servicio Core");
+
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
         }
 
-    
+        // DELETE: api/clientes/{id}
         [HttpDelete("{id}")]
         public async Task<IActionResult> DeleteCliente(int id)
         {
-            var param = new SqlParameter("@Id", id);
-            await _context.Database.ExecuteSqlRawAsync("EXEC sp_EliminarCliente @Id", param);
-            return NoContent();
+            using var transaction = await _context.Database.BeginTransactionAsync();
+
+            try
+            {
+                // 1. Verificar que existe en BD local
+                var clienteExistente = await _context.Clientes.FindAsync(id);
+                if (clienteExistente == null)
+                {
+                    await transaction.RollbackAsync();
+                    return NotFound($"No se encontró el cliente con ID {id} en BD local");
+                }
+
+                // 2. Eliminar de BD local
+                _context.Clientes.Remove(clienteExistente);
+                await _context.SaveChangesAsync();
+
+                // 3. Eliminar del servicio Core
+                await _coreService.DeleteAsync($"Clientes/{id}");
+
+                // 4. Confirmar transacción
+                await transaction.CommitAsync();
+
+                return Ok(new { mensaje = "Cliente eliminado correctamente" });
+            }
+            catch (HttpRequestException ex)
+            {
+                await transaction.RollbackAsync();
+                if (ex.Message.Contains("404"))
+                    return NotFound($"No se encontró el cliente con ID {id} en el servicio Core");
+
+                return StatusCode(500, $"Error al conectar con el servicio Core: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                return StatusCode(500, $"Error interno: {ex.Message}");
+            }
+        }
+
+        // Método adicional para obtener clientes desde BD local
+        [HttpGet("local")]
+        public async Task<ActionResult<IEnumerable<Cliente>>> GetClientesLocal()
+        {
+            try
+            {
+                var clientes = await _context.Clientes.ToListAsync();
+                return Ok(clientes);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Error al obtener clientes de BD local: {ex.Message}");
+            }
         }
     }
 }

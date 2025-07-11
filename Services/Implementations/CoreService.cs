@@ -1,76 +1,112 @@
-﻿using SistemaMasajes.Integracion.Models.DTOs;
+﻿// En la carpeta Implementations
 using SistemaMasajes.Integracion.Services.Interfaces;
+using System.Text;
 using System.Text.Json;
 
-namespace SistemaMasajes.Integracion.Services.Implementations
+public class CoreService : ICoreService
 {
-    public class CoreService : ICoreService
+    private readonly HttpClient _httpClient;
+    private readonly IConfiguration _configuration;
+
+    public CoreService(HttpClient httpClient, IConfiguration configuration)
     {
-        private readonly HttpClient _httpClient;
-        private readonly string _coreApiUrl;
+        _httpClient = httpClient;
+        _configuration = configuration;
 
-        public CoreService(HttpClient httpClient, IConfiguration configuration)
+        // Configurar BaseAddress si no está configurado
+        if (_httpClient.BaseAddress == null)
         {
-            _httpClient = httpClient;
-            _coreApiUrl = configuration["ApiUrls:Core"] ?? "https://localhost:5001";
+            var baseUrl = _configuration["ApiSettings:BaseUrl"] ?? "https://localhost:5001/";
+            _httpClient.BaseAddress = new Uri(baseUrl);
         }
+    }
 
-        public async Task<ClienteDTO> ObtenerClienteAsync(int id)
+    public async Task<T> GetAsync<T>(string endpoint)
+    {
+        try
         {
-            var response = await _httpClient.GetAsync($"{_coreApiUrl}/api/clientes/{id}");
+            var response = await _httpClient.GetAsync(endpoint);
+
             if (response.IsSuccessStatusCode)
             {
-                var json = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<ClienteDTO>(json, new JsonSerializerOptions
+                var content = await response.Content.ReadAsStringAsync();
+                return JsonSerializer.Deserialize<T>(content, new JsonSerializerOptions
                 {
                     PropertyNameCaseInsensitive = true
                 });
             }
-            return null;
-        }
 
-        public async Task<IEnumerable<ClienteDTO>> ObtenerClientesAsync()
+            throw new HttpRequestException($"Error en la petición: {response.StatusCode}");
+        }
+        catch (Exception ex)
         {
-            var response = await _httpClient.GetAsync($"{_coreApiUrl}/api/clientes");
+            // Log del error
+            throw new Exception($"Error inesperado en GET a {endpoint}: {ex.Message}", ex);
+        }
+    }
+
+    public async Task<T> PostAsync<T>(string endpoint, object data)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(data);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PostAsync(endpoint, content);
+
             if (response.IsSuccessStatusCode)
             {
-                var json = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<IEnumerable<ClienteDTO>>(json, new JsonSerializerOptions
+                var responseContent = await response.Content.ReadAsStringAsync();
+                return JsonSerializer.Deserialize<T>(responseContent, new JsonSerializerOptions
                 {
                     PropertyNameCaseInsensitive = true
                 });
             }
-            return new List<ClienteDTO>();
+
+            throw new HttpRequestException($"Error en la petición: {response.StatusCode}");
         }
-
-        public async Task<ClienteDTO> CrearClienteAsync(ClienteDTO cliente)
+        catch (Exception ex)
         {
-            var json = JsonSerializer.Serialize(cliente);
-            var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            throw new Exception($"Error inesperado en POST a {endpoint}: {ex.Message}", ex);
+        }
+    }
 
-            var response = await _httpClient.PostAsync($"{_coreApiUrl}/api/clientes", content);
+    public async Task<T> PutAsync<T>(string endpoint, object data)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(data);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PutAsync(endpoint, content);
+
             if (response.IsSuccessStatusCode)
             {
-                var responseJson = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<ClienteDTO>(responseJson, new JsonSerializerOptions
+                var responseContent = await response.Content.ReadAsStringAsync();
+                return JsonSerializer.Deserialize<T>(responseContent, new JsonSerializerOptions
                 {
                     PropertyNameCaseInsensitive = true
                 });
             }
-            return null;
-        }
 
-        // Implementar métodos similares para CitaDTO...
-        public async Task<CitaDTO> CrearCitaAsync(CitaDTO cita)
-        {
-            // Implementación similar al método CrearClienteAsync
-            throw new NotImplementedException();
+            throw new HttpRequestException($"Error en la petición: {response.StatusCode}");
         }
-
-        public async Task<IEnumerable<CitaDTO>> ObtenerCitasAsync()
+        catch (Exception ex)
         {
-            // Implementación similar al método ObtenerClientesAsync
-            throw new NotImplementedException();
+            throw new Exception($"Error inesperado en PUT a {endpoint}: {ex.Message}", ex);
+        }
+    }
+
+    public async Task<bool> DeleteAsync(string endpoint)
+    {
+        try
+        {
+            var response = await _httpClient.DeleteAsync(endpoint);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"Error inesperado en DELETE a {endpoint}: {ex.Message}", ex);
         }
     }
 }
