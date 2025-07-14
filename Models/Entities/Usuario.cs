@@ -21,7 +21,7 @@ namespace SistemaMasajes.Integracion.Models.Entities
         public int RolId { get; set; }
 
         [ForeignKey("RolId")]
-        public virtual Rol Rol { get; set; }
+        public virtual Rol? Rol { get; set; }
 
         public bool Activo { get; set; } = true;
 
